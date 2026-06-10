@@ -9,6 +9,7 @@ const { fileURLToPath } = require("url");
 const DEFAULT_SETTINGS = {
   pythonExecutable: "",
   defaultVenvPath: "{{pluginDir}}/.venv",
+  downloadsDir: "",
   scriptCatalogUrl: "https://raw.githubusercontent.com/jlb-jlb/vault-script-runner/main/catalog/catalog.json",
   installedScripts: {},
   scripts: [],
@@ -80,6 +81,25 @@ module.exports = class VaultScriptRunnerPlugin extends Plugin {
 
   getScriptsDir() {
     return path.join(this.getPluginDir(), "scripts");
+  }
+
+  getDownloadsDir() {
+    const override = String(this.settings.downloadsDir || "").trim();
+    if (override) {
+      const home = os.homedir();
+      const rendered = stripWrappingQuotes(
+        this.renderTemplate(override, {
+          vault: this.getVaultBasePath(),
+          pluginDir: this.getPluginDir(),
+          home,
+        }).trim()
+      );
+      const expanded = rendered.replace(/^~(?=[\\/]|$)/, home);
+      if (expanded) {
+        return path.isAbsolute(expanded) ? expanded : path.join(this.getVaultBasePath() || home, expanded);
+      }
+    }
+    return resolveDownloadsDir();
   }
 
   getScripts() {
@@ -240,7 +260,7 @@ module.exports = class VaultScriptRunnerPlugin extends Plugin {
     const activeFilePath = activeFile ? activeFile.path : "";
     const activeFolder = normalizeObsidianFolder(activeFile && activeFile.parent ? activeFile.parent.path : "");
     const activeFolderPrefix = activeFolder ? `${activeFolder}/` : "";
-    const downloadsPath = path.join(os.homedir(), "Downloads");
+    const downloadsPath = this.getDownloadsDir();
     const latestDownload = findLatestFile(downloadsPath);
     const latestDownloadPdf = findLatestFile(downloadsPath, ".pdf");
     const now = new Date();
@@ -606,6 +626,16 @@ class VaultScriptRunnerSettingTab extends PluginSettingTab {
       .addText((text) => {
         text.setPlaceholder("{{pluginDir}}/.venv").setValue(this.plugin.settings.defaultVenvPath || "").onChange(async (value) => {
           this.plugin.settings.defaultVenvPath = value;
+          await this.plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Downloads folder")
+      .setDesc("Used by {{downloads}} and {{latestDownload}}. Leave empty to auto-detect (honors XDG user-dirs on Linux). Supports ~ and templates.")
+      .addText((text) => {
+        text.setPlaceholder(resolveDownloadsDir()).setValue(this.plugin.settings.downloadsDir || "").onChange(async (value) => {
+          this.plugin.settings.downloadsDir = value;
           await this.plugin.saveSettings();
         });
       });
@@ -1056,6 +1086,30 @@ function addPathVariables(variables, prefix, rawValue) {
   variables[`${prefix}.stem`] = path.basename(value, path.extname(value));
   variables[`${prefix}.dirname`] = path.dirname(value);
   variables[`${prefix}.ext`] = path.extname(value);
+}
+
+function resolveDownloadsDir() {
+  const home = os.homedir();
+  // On Linux the Downloads folder can be relocated via XDG user-dirs; honor it.
+  if (process.platform === "linux") {
+    const candidate = process.env.XDG_DOWNLOAD_DIR || readXdgDownloadDir(home);
+    if (candidate) {
+      const resolved = candidate.replace(/\$HOME/g, home).replace(/^~(?=[\\/]|$)/, home);
+      if (resolved) return resolved;
+    }
+  }
+  return path.join(home, "Downloads");
+}
+
+function readXdgDownloadDir(home) {
+  try {
+    const configHome = process.env.XDG_CONFIG_HOME || path.join(home, ".config");
+    const text = fs.readFileSync(path.join(configHome, "user-dirs.dirs"), "utf8");
+    const match = text.match(/^\s*XDG_DOWNLOAD_DIR\s*=\s*"([^"]*)"/m);
+    return match ? match[1] : "";
+  } catch (_error) {
+    return "";
+  }
 }
 
 function findLatestFile(directory, extension) {
