@@ -31,7 +31,9 @@ Example:
 from __future__ import annotations
 
 import argparse
+import os
 import re
+import stat
 import sys
 from pathlib import Path
 
@@ -193,6 +195,27 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def write_output(output_md: Path, content: str) -> None:
+    """Write the cleaned note, clearing a read-only attribute if one blocks it."""
+    try:
+        output_md.write_text(content, encoding="utf-8")
+        return
+    except PermissionError:
+        # On Windows an existing file with the read-only attribute (or a 0o444
+        # mode on POSIX) raises PermissionError. Clear it and retry once.
+        if not output_md.exists():
+            raise
+    try:
+        os.chmod(output_md, stat.S_IWRITE | stat.S_IREAD)
+        output_md.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        raise SystemExit(
+            f"Permission denied writing {output_md}. The file may be read-only, "
+            "open with an exclusive lock in another program, or held by a cloud "
+            f"sync client. Close it or clear its read-only flag, then retry. ({exc})"
+        )
+
+
 def main() -> int:
     args = parse_args()
 
@@ -230,7 +253,7 @@ def main() -> int:
     )
 
     output_md.parent.mkdir(parents=True, exist_ok=True)
-    output_md.write_text(cleaned, encoding="utf-8")
+    write_output(output_md, cleaned)
 
     citations_removed = len(CITATION_RUN.findall(original))
     display_converted = len(DISPLAY_MATH.findall(original))

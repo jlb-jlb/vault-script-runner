@@ -34,7 +34,7 @@
     {
       "id": "clean-chatgpt-research",
       "name": "Clean ChatGPT research report",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "description": "Fix a ChatGPT deep-research Markdown report for Obsidian: convert \\( \\) and \\[ \\] math to $ and $$, and strip invisible citation artifacts.",
       "fileName": "clean_gpt_research.py",
       "path": "clean_gpt_research.py",
