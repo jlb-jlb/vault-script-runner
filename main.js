@@ -7,8 +7,8 @@ const path = require("path");
 const { fileURLToPath } = require("url");
 
 const DEFAULT_SETTINGS = {
-  pythonExecutable: "python",
-  defaultVenvPath: "{{pluginDir}}\\.venv",
+  pythonExecutable: "",
+  defaultVenvPath: "{{pluginDir}}/.venv",
   scriptCatalogUrl: "https://raw.githubusercontent.com/jlb-jlb/vault-script-runner/main/catalog/catalog.json",
   installedScripts: {},
   scripts: [],
@@ -287,7 +287,7 @@ module.exports = class VaultScriptRunnerPlugin extends Plugin {
 
   addVenvVariables(script, variables) {
     const vaultPath = variables.vault || this.getVaultBasePath();
-    const sharedTemplate = this.settings.defaultVenvPath || "{{pluginDir}}\\.venv";
+    const sharedTemplate = this.settings.defaultVenvPath || "{{pluginDir}}/.venv";
     let sharedVenvPath = stripWrappingQuotes(this.renderTemplate(sharedTemplate, variables).trim());
     if (sharedVenvPath && !path.isAbsolute(sharedVenvPath)) {
       sharedVenvPath = path.join(vaultPath, sharedVenvPath);
@@ -332,15 +332,35 @@ module.exports = class VaultScriptRunnerPlugin extends Plugin {
     }
 
     if (!fs.existsSync(venvPython)) {
-      const creator = stripWrappingQuotes(
-        this.renderTemplate(script.pythonExecutable || this.settings.pythonExecutable || "python", variables).trim()
+      const configured = stripWrappingQuotes(
+        this.renderTemplate(script.pythonExecutable || this.settings.pythonExecutable || "", variables).trim()
       );
+      // Try the configured interpreter first, then OS-appropriate fallbacks, so a
+      // fresh machine works whether the interpreter is `python`, `python3`, or `py`.
+      const fallbacks = process.platform === "win32" ? ["python", "py", "python3"] : ["python3", "python"];
+      const candidates = [configured, ...fallbacks].filter(
+        (name, index, all) => name && all.indexOf(name) === index
+      );
+
       fs.mkdirSync(path.dirname(venvPath), { recursive: true });
       new Notice(`Creating virtual environment for ${script.name}`);
-      const createResult = await runProcess(creator, ["-m", "venv", venvPath], { cwd, env, shell: false });
-      setupLogs.push({ label: "create virtual environment", result: createResult });
-      if (createResult.code !== 0 || !fs.existsSync(venvPython)) {
-        throw new Error(`Could not create virtual environment.\n${createResult.stderr || createResult.stdout}`);
+
+      let createResult = null;
+      const tried = [];
+      for (const creator of candidates) {
+        createResult = await runProcess(creator, ["-m", "venv", venvPath], { cwd, env, shell: false });
+        setupLogs.push({ label: `create virtual environment (${creator})`, result: createResult });
+        tried.push(creator);
+        if (createResult.code === 0 && fs.existsSync(venvPython)) {
+          break;
+        }
+      }
+      if (!createResult || createResult.code !== 0 || !fs.existsSync(venvPython)) {
+        throw new Error(
+          `Could not create virtual environment. Tried interpreter(s): ${tried.join(", ")}. ` +
+            "Set a working Python interpreter under Vault Script Runner settings.\n" +
+            (createResult?.stderr || createResult?.stdout || "")
+        );
       }
     }
 
@@ -584,7 +604,7 @@ class VaultScriptRunnerSettingTab extends PluginSettingTab {
       .setName("Default virtual environment path")
       .setDesc("Relative paths resolve from the vault. Templates are supported.")
       .addText((text) => {
-        text.setPlaceholder("{{pluginDir}}\\.venv").setValue(this.plugin.settings.defaultVenvPath || "").onChange(async (value) => {
+        text.setPlaceholder("{{pluginDir}}/.venv").setValue(this.plugin.settings.defaultVenvPath || "").onChange(async (value) => {
           this.plugin.settings.defaultVenvPath = value;
           await this.plugin.saveSettings();
         });
