@@ -1,70 +1,24 @@
-const { Modal, Notice, Plugin, PluginSettingTab, Setting } = require("obsidian");
+const { Modal, Notice, Plugin, PluginSettingTab, Setting, requestUrl } = require("obsidian");
 const { spawn } = require("child_process");
+const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-
-const PDF_SCRIPT_ID = "pdf-to-obsidian-images";
+const { fileURLToPath } = require("url");
 
 const DEFAULT_SETTINGS = {
   pythonExecutable: "python",
   defaultVenvPath: "{{pluginDir}}\\.venv",
-  scripts: [
-    {
-      id: PDF_SCRIPT_ID,
-      name: "PDF to Obsidian images",
-      command: "{{venvPython}}",
-      arguments: [
-        "{{pluginDir}}\\scripts\\pdf_to_obsidian_images.py",
-        "--vault",
-        "{{vault}}",
-        "--attachments",
-        "_Attachments",
-        "--attachment-subdir",
-        "{pdf_stem}",
-        "--output",
-        "{{activeFolderPrefix}}{{pdfPath.stem}}.md",
-        "--title",
-        "{{pdfPath.stem}}",
-        "--backend",
-        "auto",
-        "--link-style",
-        "html",
-        "--alt-text",
-        "extracted",
-        "--text-output",
-        "none",
-        "--format",
-        "jpg",
-        "{{pdfPath}}",
-      ].join("\n"),
-      cwd: "{{vault}}",
-      parameters: [
-        {
-          name: "pdfPath",
-          label: "PDF path",
-          placeholder: "C:\\Users\\you\\Downloads\\lecture.pdf",
-          defaultValue: "{{latestDownloadPdf}}",
-        },
-      ],
-      env: "",
-      useVenv: true,
-      venvPath: "",
-      pythonExecutable: "",
-      requirements: "pymupdf",
-      runInShell: false,
-      openOutput: true,
-    },
-  ],
+  scriptCatalogUrl: "{{pluginDir}}\\catalog\\catalog.json",
+  installedScripts: {},
+  scripts: [],
 };
 
 module.exports = class VaultScriptRunnerPlugin extends Plugin {
   async onload() {
     await this.loadSettings();
 
-    this.addRibbonIcon("terminal", "Run script", () => {
-      this.openScriptPicker();
-    });
+    this.addRibbonIcon("terminal", "Run script", () => this.openScriptPicker());
 
     this.addCommand({
       id: "run-configured-script",
@@ -73,9 +27,16 @@ module.exports = class VaultScriptRunnerPlugin extends Plugin {
     });
 
     this.addCommand({
-      id: "run-pdf-to-obsidian-images",
-      name: "Run PDF to Obsidian images",
-      callback: () => this.runScriptById(PDF_SCRIPT_ID),
+      id: "refresh-script-catalog",
+      name: "Refresh script catalog",
+      callback: async () => {
+        try {
+          await this.fetchScriptCatalog();
+          new Notice("Script catalog refreshed.");
+        } catch (error) {
+          new Notice(`Could not refresh script catalog: ${error.message}`, 10000);
+        }
+      },
     });
 
     this.addSettingTab(new VaultScriptRunnerSettingTab(this.app, this));
@@ -83,49 +44,17 @@ module.exports = class VaultScriptRunnerPlugin extends Plugin {
 
   async loadSettings() {
     const loaded = await this.loadData();
-    this.settings = mergeSettings(DEFAULT_SETTINGS, loaded);
-    if (JSON.stringify(loaded || {}) !== JSON.stringify(this.settings)) {
-      await this.saveSettings();
-    }
+    const data = loaded && typeof loaded === "object" ? loaded : {};
+    this.settings = {
+      ...DEFAULT_SETTINGS,
+      ...data,
+      installedScripts: data.installedScripts && typeof data.installedScripts === "object" ? data.installedScripts : {},
+      scripts: Array.isArray(data.scripts) ? data.scripts.map((script) => normalizeScript(script)) : [],
+    };
   }
 
   async saveSettings() {
     await this.saveData(this.settings);
-  }
-
-  openScriptPicker() {
-    const scripts = this.getScripts();
-    if (scripts.length === 0) {
-      new Notice("Vault Script Runner: no scripts configured.");
-      return;
-    }
-
-    if (scripts.length === 1) {
-      this.openRunModal(scripts[0]);
-      return;
-    }
-
-    new ScriptPickerModal(this.app, this, scripts).open();
-  }
-
-  runScriptById(id) {
-    const script = this.getScripts().find((item) => item.id === id);
-    if (!script) {
-      new Notice(`Vault Script Runner: script not found: ${id}`);
-      return;
-    }
-    this.openRunModal(script);
-  }
-
-  openRunModal(script) {
-    new ScriptRunModal(this.app, this, script).open();
-  }
-
-  getScripts() {
-    if (!Array.isArray(this.settings.scripts)) {
-      return [];
-    }
-    return this.settings.scripts.filter((script) => script && script.name && script.command);
   }
 
   getVaultBasePath() {
@@ -141,26 +70,135 @@ module.exports = class VaultScriptRunnerPlugin extends Plugin {
 
   getPluginDir() {
     const vaultPath = this.getVaultBasePath();
-    if (!vaultPath) {
-      return "";
-    }
-    return path.join(vaultPath, ".obsidian", "plugins", this.manifest.id);
+    return vaultPath ? path.join(vaultPath, ".obsidian", "plugins", this.manifest.id) : "";
   }
 
-  buildVariables(parameterValues) {
+  getScriptsDir() {
+    return path.join(this.getPluginDir(), "scripts");
+  }
+
+  getScripts() {
+    return Array.isArray(this.settings.scripts)
+      ? this.settings.scripts.filter((script) => script && script.name && script.command)
+      : [];
+  }
+
+  openScriptPicker() {
+    const scripts = this.getScripts();
+    if (scripts.length === 0) {
+      new Notice("Vault Script Runner: no scripts configured.");
+      return;
+    }
+    if (scripts.length === 1) {
+      this.openRunModal(scripts[0]);
+      return;
+    }
+    new ScriptPickerModal(this.app, this, scripts).open();
+  }
+
+  openRunModal(script) {
+    new ScriptRunModal(this.app, this, script).open();
+  }
+
+  async fetchScriptCatalog() {
+    const variables = this.buildVariables({});
+    const catalogUrl = stripWrappingQuotes(this.renderTemplate(this.settings.scriptCatalogUrl || "", variables).trim());
+    if (!catalogUrl) {
+      throw new Error("Script catalog URL is empty.");
+    }
+
+    const text = await readTextLocation(catalogUrl, this.getPluginDir());
+    const catalog = JSON.parse(text);
+    if (!catalog || !Array.isArray(catalog.scripts)) {
+      throw new Error("Script catalog must contain a scripts array.");
+    }
+
+    this.scriptCatalog = {
+      ...catalog,
+      url: catalogUrl,
+      scripts: catalog.scripts.map((entry) => normalizeCatalogEntry(entry)).filter(Boolean),
+    };
+    this.scriptCatalogError = "";
+    return this.scriptCatalog;
+  }
+
+  getCatalogScriptPath(entry) {
+    return path.join(this.getScriptsDir(), safeScriptFileName(entry.fileName || `${entry.id}.py`));
+  }
+
+  getCatalogScriptUrl(entry) {
+    const catalogUrl = this.scriptCatalog?.url || this.renderTemplate(this.settings.scriptCatalogUrl || "", this.buildVariables({}));
+    return resolveLocation(entry.url || entry.path || entry.fileName, catalogUrl);
+  }
+
+  getCatalogInstallState(entry) {
+    const installed = this.settings.installedScripts?.[entry.id] || null;
+    const scriptPath = this.getCatalogScriptPath(entry);
+    if (!installed) {
+      return { status: "download", installed, scriptPath };
+    }
+    if (compareVersions(entry.version || "0.0.0", installed.version || "0.0.0") > 0) {
+      return { status: "update", installed, scriptPath };
+    }
+    if (!fs.existsSync(scriptPath)) {
+      return { status: "download", installed, scriptPath };
+    }
+    return { status: "installed", installed, scriptPath };
+  }
+
+  async installCatalogScript(entry) {
+    const scriptUrl = this.getCatalogScriptUrl(entry);
+    const content = await readTextLocation(scriptUrl, this.getPluginDir());
+    const actualHash = sha256(content);
+    if (entry.sha256 && actualHash.toLowerCase() !== String(entry.sha256).toLowerCase()) {
+      throw new Error(`Hash mismatch. Expected ${entry.sha256}, got ${actualHash}.`);
+    }
+
+    const targetPath = this.getCatalogScriptPath(entry);
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    fs.writeFileSync(targetPath, content, "utf8");
+
+    this.settings.installedScripts = {
+      ...(this.settings.installedScripts || {}),
+      [entry.id]: {
+        id: entry.id,
+        name: entry.name,
+        version: entry.version || "0.0.0",
+        fileName: path.basename(targetPath),
+        sourceUrl: scriptUrl,
+        installedAt: new Date().toISOString(),
+        sha256: entry.sha256 || actualHash,
+      },
+    };
+
+    if (entry.preset) {
+      const preset = normalizeScript({
+        ...entry.preset,
+        catalogScriptId: entry.id,
+      });
+      upsertScriptPreset(this.settings.scripts, preset);
+    }
+
+    await this.saveSettings();
+  }
+
+  buildVariables(parameterValues = {}, script = null) {
     const vaultPath = this.getVaultBasePath();
     const pluginDir = this.getPluginDir();
+    const scriptsDir = this.getScriptsDir();
     const activeFile = this.app.workspace.getActiveFile();
     const activeFilePath = activeFile ? activeFile.path : "";
     const activeFolder = normalizeObsidianFolder(activeFile && activeFile.parent ? activeFile.parent.path : "");
     const activeFolderPrefix = activeFolder ? `${activeFolder}/` : "";
-    const now = new Date();
     const downloadsPath = path.join(os.homedir(), "Downloads");
     const latestDownload = findLatestFile(downloadsPath);
     const latestDownloadPdf = findLatestFile(downloadsPath, ".pdf");
+    const now = new Date();
+
     const variables = {
       vault: vaultPath,
       pluginDir,
+      scriptsDir,
       downloads: downloadsPath,
       latestDownload,
       latestDownloadPdf,
@@ -171,11 +209,23 @@ module.exports = class VaultScriptRunnerPlugin extends Plugin {
       time: formatTime(now),
     };
 
+    if (script && script.catalogScriptId) {
+      const installed = this.settings.installedScripts?.[script.catalogScriptId];
+      const scriptPath = installed ? path.join(scriptsDir, installed.fileName) : "";
+      variables.scriptPath = scriptPath;
+      variables.scriptDir = scriptPath ? path.dirname(scriptPath) : scriptsDir;
+      variables.scriptVersion = installed?.version || "";
+      addPathVariables(variables, "scriptPath", scriptPath);
+      addPathVariables(variables, "scriptDir", variables.scriptDir);
+    }
+
     addPathVariables(variables, "activeFile", activeFilePath);
+    addPathVariables(variables, "activeFolder", activeFolder);
     addPathVariables(variables, "downloads", downloadsPath);
     addPathVariables(variables, "latestDownload", latestDownload);
     addPathVariables(variables, "latestDownloadPdf", latestDownloadPdf);
-    addPathVariables(variables, "activeFolder", activeFolder);
+    addPathVariables(variables, "pluginDir", pluginDir);
+    addPathVariables(variables, "scriptsDir", scriptsDir);
 
     for (const [key, value] of Object.entries(parameterValues)) {
       variables[key] = value;
@@ -192,6 +242,7 @@ module.exports = class VaultScriptRunnerPlugin extends Plugin {
     if (sharedVenvPath && !path.isAbsolute(sharedVenvPath)) {
       sharedVenvPath = path.join(vaultPath, sharedVenvPath);
     }
+
     variables.sharedVenvPath = sharedVenvPath;
     variables.sharedVenvPython = sharedVenvPath ? getVenvPythonPath(sharedVenvPath) : "";
     addPathVariables(variables, "sharedVenvPath", sharedVenvPath);
@@ -208,14 +259,11 @@ module.exports = class VaultScriptRunnerPlugin extends Plugin {
     addPathVariables(variables, "venvPath", venvPath);
     addPathVariables(variables, "venvPython", variables.venvPython);
 
-    return {
-      venvPath,
-      venvPython: variables.venvPython,
-    };
+    return { venvPath, venvPython: variables.venvPython };
   }
 
   renderTemplate(value, variables) {
-    return String(value || "").replace(/\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g, (_match, key) => {
+    return String(value || "").replace(/\{\{\s*([A-Za-z0-9_.:-]+)\s*\}\}/g, (_match, key) => {
       if (Object.prototype.hasOwnProperty.call(variables, key)) {
         return variables[key] == null ? "" : String(variables[key]);
       }
@@ -234,25 +282,15 @@ module.exports = class VaultScriptRunnerPlugin extends Plugin {
     }
 
     if (!fs.existsSync(venvPython)) {
-      const creatorTemplate = script.pythonExecutable || this.settings.pythonExecutable || "python";
-      const creator = stripWrappingQuotes(this.renderTemplate(creatorTemplate, variables).trim());
-      if (!creator) {
-        throw new Error("Python executable for venv creation is empty.");
-      }
-
+      const creator = stripWrappingQuotes(
+        this.renderTemplate(script.pythonExecutable || this.settings.pythonExecutable || "python", variables).trim()
+      );
       fs.mkdirSync(path.dirname(venvPath), { recursive: true });
       new Notice(`Creating virtual environment for ${script.name}`);
-      const createResult = await runProcess(creator, ["-m", "venv", venvPath], {
-        cwd,
-        env,
-        shell: false,
-      });
+      const createResult = await runProcess(creator, ["-m", "venv", venvPath], { cwd, env, shell: false });
       setupLogs.push({ label: "create virtual environment", result: createResult });
-
       if (createResult.code !== 0 || !fs.existsSync(venvPython)) {
-        throw new Error(
-          `Could not create virtual environment at ${venvPath}.\n${createResult.stderr || createResult.stdout}`
-        );
+        throw new Error(`Could not create virtual environment.\n${createResult.stderr || createResult.stdout}`);
       }
     }
 
@@ -261,11 +299,10 @@ module.exports = class VaultScriptRunnerPlugin extends Plugin {
       return;
     }
 
-    const requirementsKey = slugify(script.id || script.name || "script");
-    const markerPath = path.join(venvPath, `.vault-script-runner-requirements.${requirementsKey}.txt`);
-    const requirementsPath = path.join(venvPath, `.vault-script-runner-requirements.${requirementsKey}.in`);
-    const previousRequirements = readTextIfExists(markerPath);
-    if (previousRequirements === requirements) {
+    const key = slugify(script.id || script.name || "script");
+    const markerPath = path.join(venvPath, `.vault-script-runner-requirements.${key}.txt`);
+    const requirementsPath = path.join(venvPath, `.vault-script-runner-requirements.${key}.in`);
+    if (readTextIfExists(markerPath) === requirements) {
       return;
     }
 
@@ -277,16 +314,14 @@ module.exports = class VaultScriptRunnerPlugin extends Plugin {
       shell: false,
     });
     setupLogs.push({ label: "install requirements", result: installResult });
-
     if (installResult.code !== 0) {
       throw new Error(`Could not install requirements.\n${installResult.stderr || installResult.stdout}`);
     }
-
     fs.writeFileSync(markerPath, requirements, "utf8");
   }
 
   async runScript(script, parameterValues) {
-    const variables = this.buildVariables(parameterValues);
+    const variables = this.buildVariables(parameterValues, script);
     this.addVenvVariables(script, variables);
 
     const cwd = stripWrappingQuotes(this.renderTemplate(script.cwd || "{{vault}}", variables).trim());
@@ -318,7 +353,6 @@ module.exports = class VaultScriptRunnerPlugin extends Plugin {
 
     const command = stripWrappingQuotes(this.renderTemplate(script.command, variables).trim());
     const args = parseArgumentLines(script.arguments).map((arg) => this.renderTemplate(arg, variables));
-
     if (!command) {
       new Notice("Vault Script Runner: command is empty.");
       return;
@@ -360,7 +394,6 @@ class ScriptPickerModal extends Modal {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.createEl("h2", { text: "Run script" });
-
     const list = contentEl.createDiv({ cls: "vault-script-runner-picker" });
     for (const script of this.scripts) {
       const button = list.createEl("button", { text: script.name });
@@ -388,14 +421,11 @@ class ScriptRunModal extends Modal {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.createEl("h2", { text: this.script.name });
-
     const parameters = normalizeParameters(this.script.parameters);
-    const defaultVariables = this.plugin.buildVariables({});
+    const defaults = this.plugin.buildVariables({}, this.script);
+
     if (parameters.length === 0) {
-      contentEl.createEl("p", {
-        text: "This script has no parameters.",
-        cls: "vault-script-runner-help",
-      });
+      contentEl.createEl("p", { text: "This script has no parameters.", cls: "vault-script-runner-help" });
     }
 
     for (const parameter of parameters) {
@@ -404,43 +434,29 @@ class ScriptRunModal extends Modal {
       const input = field.createEl("input", {
         type: parameter.secret ? "password" : "text",
         placeholder: parameter.placeholder || "",
-        value: this.plugin.renderTemplate(parameter.defaultValue || "", defaultVariables),
+        value: this.plugin.renderTemplate(parameter.defaultValue || "", defaults),
       });
       this.inputs.set(parameter.name, input);
     }
 
     const actions = contentEl.createDiv({ cls: "vault-script-runner-actions" });
-    const cancel = actions.createEl("button", { text: "Cancel" });
-    cancel.addEventListener("click", () => this.close());
-
+    actions.createEl("button", { text: "Cancel" }).addEventListener("click", () => this.close());
     const run = actions.createEl("button", { text: "Run" });
     run.addClass("mod-cta");
     run.addEventListener("click", () => this.submit());
-
-    this.scope.register([], "Enter", (event) => {
-      if (event.ctrlKey || event.metaKey) {
-        this.submit();
-        return false;
-      }
-      return true;
-    });
-
     const firstInput = this.inputs.values().next().value;
-    if (firstInput) {
-      firstInput.focus();
-    } else {
-      run.focus();
-    }
+    if (firstInput) firstInput.focus();
+    else run.focus();
   }
 
   submit() {
     const values = {};
     const parameters = normalizeParameters(this.script.parameters);
-    const defaultVariables = this.plugin.buildVariables({});
+    const defaults = this.plugin.buildVariables({}, this.script);
     for (const parameter of parameters) {
       const input = this.inputs.get(parameter.name);
       const rawValue = input ? input.value.trim() : "";
-      const fallback = this.plugin.renderTemplate(parameter.defaultValue || "", defaultVariables).trim();
+      const fallback = this.plugin.renderTemplate(parameter.defaultValue || "", defaults).trim();
       values[parameter.name] = stripWrappingQuotes(rawValue || fallback);
     }
     this.close();
@@ -463,7 +479,6 @@ class ScriptOutputModal extends Modal {
     const result = this.result;
     contentEl.empty();
     contentEl.createEl("h2", { text: result.code === 0 ? "Script finished" : "Script output" });
-
     const durationMs = result.finishedAt.getTime() - result.startedAt.getTime();
     contentEl.createEl("div", {
       cls: "vault-script-runner-output-meta",
@@ -479,24 +494,14 @@ class ScriptOutputModal extends Modal {
     if (Array.isArray(result.setupLogs) && result.setupLogs.length > 0) {
       contentEl.createEl("h3", { text: "setup" });
       for (const entry of result.setupLogs) {
-        contentEl.createEl("pre", {
-          cls: "vault-script-runner-output",
-          text: formatSetupLog(entry),
-        });
+        contentEl.createEl("pre", { cls: "vault-script-runner-output", text: formatSetupLog(entry) });
       }
     }
 
     contentEl.createEl("h3", { text: "stdout" });
-    contentEl.createEl("pre", {
-      cls: "vault-script-runner-output",
-      text: result.stdout || "(empty)",
-    });
-
+    contentEl.createEl("pre", { cls: "vault-script-runner-output", text: result.stdout || "(empty)" });
     contentEl.createEl("h3", { text: "stderr" });
-    contentEl.createEl("pre", {
-      cls: "vault-script-runner-output",
-      text: result.stderr || "(empty)",
-    });
+    contentEl.createEl("pre", { cls: "vault-script-runner-output", text: result.stderr || "(empty)" });
   }
 
   onClose() {
@@ -513,16 +518,11 @@ class VaultScriptRunnerSettingTab extends PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-
     containerEl.createEl("h2", { text: "Vault Script Runner" });
-    containerEl.createEl("p", {
-      cls: "vault-script-runner-help",
-      text: "Configure local scripts. Arguments are one per line and support {{variable}} templates.",
-    });
 
     new Setting(containerEl)
       .setName("Python executable")
-      .setDesc("Used to create virtual environments. Script presets can override this.")
+      .setDesc("Used to create shared virtual environments.")
       .addText((text) => {
         text.setPlaceholder("python").setValue(this.plugin.settings.pythonExecutable || "").onChange(async (value) => {
           this.plugin.settings.pythonExecutable = value;
@@ -534,18 +534,43 @@ class VaultScriptRunnerSettingTab extends PluginSettingTab {
       .setName("Default virtual environment path")
       .setDesc("Relative paths resolve from the vault. Templates are supported.")
       .addText((text) => {
-        text
-          .setPlaceholder("{{pluginDir}}\\.venv")
-          .setValue(this.plugin.settings.defaultVenvPath || "")
-          .onChange(async (value) => {
-            this.plugin.settings.defaultVenvPath = value;
-            await this.plugin.saveSettings();
-          });
+        text.setPlaceholder("{{pluginDir}}\\.venv").setValue(this.plugin.settings.defaultVenvPath || "").onChange(async (value) => {
+          this.plugin.settings.defaultVenvPath = value;
+          await this.plugin.saveSettings();
+        });
       });
 
     new Setting(containerEl)
+      .setName("Script catalog URL")
+      .setDesc("Catalog JSON. Supports HTTPS, file://, absolute local paths, and templates.")
+      .addText((text) => {
+        text.setPlaceholder("https://raw.githubusercontent.com/user/repo/main/catalog/catalog.json")
+          .setValue(this.plugin.settings.scriptCatalogUrl || "")
+          .onChange(async (value) => {
+            this.plugin.settings.scriptCatalogUrl = value;
+            this.plugin.scriptCatalog = null;
+            this.plugin.scriptCatalogError = "";
+            await this.plugin.saveSettings();
+          });
+      })
+      .addButton((button) => {
+        button.setButtonText("Refresh").onClick(async () => {
+          try {
+            await this.plugin.fetchScriptCatalog();
+            new Notice("Script catalog refreshed.");
+          } catch (error) {
+            this.plugin.scriptCatalogError = error.message;
+            new Notice(`Could not refresh catalog: ${error.message}`, 10000);
+          }
+          this.display();
+        });
+      });
+
+    this.renderCatalog(containerEl);
+
+    new Setting(containerEl)
       .setName("Add script")
-      .setDesc("Create a new blank script preset.")
+      .setDesc("Create a blank script preset manually.")
       .addButton((button) => {
         button.setButtonText("Add").onClick(async () => {
           this.plugin.settings.scripts.push(createBlankScript());
@@ -565,44 +590,108 @@ class VaultScriptRunnerSettingTab extends PluginSettingTab {
         });
       });
 
-    this.plugin.settings.scripts.forEach((script, index) => {
-      this.renderScript(containerEl, script, index);
-    });
+    this.plugin.settings.scripts.forEach((script, index) => this.renderScript(containerEl, script, index));
+  }
+
+  renderCatalog(containerEl) {
+    const wrapper = containerEl.createDiv({ cls: "vault-script-runner-script" });
+    wrapper.createEl("h3", { text: "Script catalog" });
+
+    if (this.plugin.scriptCatalogError) {
+      wrapper.createEl("p", { cls: "vault-script-runner-help", text: `Last refresh failed: ${this.plugin.scriptCatalogError}` });
+    }
+    if (!this.plugin.scriptCatalog && !this.plugin.scriptCatalogError) {
+      wrapper.createEl("p", { cls: "vault-script-runner-help", text: "Loading script catalog..." });
+      this.loadCatalogForSettings();
+      return;
+    }
+
+    if (!this.plugin.scriptCatalog) {
+      wrapper.createEl("p", { cls: "vault-script-runner-help", text: "Refresh the catalog to list downloadable scripts." });
+      return;
+    }
+
+    const entries = this.plugin.scriptCatalog.scripts || [];
+    const downloads = entries.filter((entry) => this.plugin.getCatalogInstallState(entry).status === "download");
+    const updates = entries.filter((entry) => this.plugin.getCatalogInstallState(entry).status === "update");
+    const current = entries.filter((entry) => this.plugin.getCatalogInstallState(entry).status === "installed");
+
+    this.renderCatalogGroup(wrapper, "Available downloads", downloads, "Download");
+    this.renderCatalogGroup(wrapper, "Updates", updates, "Update");
+    if (current.length > 0) {
+      wrapper.createEl("p", {
+        cls: "vault-script-runner-help",
+        text: `Installed and current: ${current.map((entry) => `${entry.name} ${entry.version}`).join(", ")}`,
+      });
+    }
+    if (downloads.length === 0 && updates.length === 0 && current.length === 0) {
+      wrapper.createEl("p", { cls: "vault-script-runner-help", text: "The catalog contains no scripts." });
+    }
+  }
+
+  renderCatalogGroup(wrapper, title, entries, buttonText) {
+    if (entries.length === 0) return;
+    wrapper.createEl("h4", { text: title });
+    for (const entry of entries) {
+      const state = this.plugin.getCatalogInstallState(entry);
+      new Setting(wrapper)
+        .setName(`${entry.name} ${entry.version || ""}`.trim())
+        .setDesc(entry.description || `Target: ${state.scriptPath}`)
+        .addButton((button) => {
+          button.setButtonText(buttonText).onClick(async () => {
+            try {
+              await this.plugin.installCatalogScript(entry);
+              await this.plugin.fetchScriptCatalog();
+              new Notice(`${buttonText} complete: ${entry.name}`);
+            } catch (error) {
+              new Notice(`Could not ${buttonText.toLowerCase()} ${entry.name}: ${error.message}`, 10000);
+            }
+            this.display();
+          });
+        });
+    }
+  }
+
+  loadCatalogForSettings() {
+    if (this.catalogLoadPromise) return;
+    this.catalogLoadPromise = this.plugin.fetchScriptCatalog()
+      .catch((error) => {
+        this.plugin.scriptCatalogError = error.message;
+      })
+      .finally(() => {
+        this.catalogLoadPromise = null;
+        this.display();
+      });
   }
 
   renderScript(containerEl, script, index) {
     const wrapper = containerEl.createDiv({ cls: "vault-script-runner-script" });
     wrapper.createEl("h3", { text: script.name || `Script ${index + 1}` });
 
-    new Setting(wrapper)
-      .setName("Name")
-      .addText((text) => {
-        text.setValue(script.name || "").onChange(async (value) => {
-          script.name = value;
-          script.id = script.id || slugify(value || `script-${index + 1}`);
-          await this.plugin.saveSettings();
-        });
-      });
+    if (script.catalogScriptId) {
+      wrapper.createEl("p", { cls: "vault-script-runner-help", text: `Catalog script: ${script.catalogScriptId}` });
+    }
 
-    new Setting(wrapper)
-      .setName("Command")
-      .setDesc("Executable name or absolute executable path. Use {{venvPython}} for Python scripts with venv enabled.")
-      .addText((text) => {
-        text.setPlaceholder("{{venvPython}}").setValue(script.command || "").onChange(async (value) => {
-          script.command = value;
-          await this.plugin.saveSettings();
-        });
+    new Setting(wrapper).setName("Name").addText((text) => {
+      text.setValue(script.name || "").onChange(async (value) => {
+        script.name = value;
+        await this.plugin.saveSettings();
       });
+    });
 
-    new Setting(wrapper)
-      .setName("Working directory")
-      .setDesc("Optional. Defaults to {{vault}}.")
-      .addText((text) => {
-        text.setPlaceholder("{{vault}}").setValue(script.cwd || "").onChange(async (value) => {
-          script.cwd = value;
-          await this.plugin.saveSettings();
-        });
+    new Setting(wrapper).setName("Command").addText((text) => {
+      text.setPlaceholder("{{venvPython}}").setValue(script.command || "").onChange(async (value) => {
+        script.command = value;
+        await this.plugin.saveSettings();
       });
+    });
+
+    new Setting(wrapper).setName("Working directory").addText((text) => {
+      text.setPlaceholder("{{vault}}").setValue(script.cwd || "").onChange(async (value) => {
+        script.cwd = value;
+        await this.plugin.saveSettings();
+      });
+    });
 
     new Setting(wrapper)
       .setName("Arguments")
@@ -618,102 +707,59 @@ class VaultScriptRunnerSettingTab extends PluginSettingTab {
 
     new Setting(wrapper)
       .setName("Parameters")
-      .setDesc("Comma-separated names to prompt for, for example: pdfPath, noteName")
+      .setDesc("Comma-separated prompt names.")
       .addText((text) => {
-        text
-          .setPlaceholder("pdfPath")
-          .setValue(normalizeParameters(script.parameters).map((parameter) => parameter.name).join(", "))
-          .onChange(async (value) => {
-            script.parameters = parseParameterNames(value).map((name) => {
-              const existing = normalizeParameters(script.parameters).find((parameter) => parameter.name === name);
-              return existing || {
-                name,
-                label: humanize(name),
-                placeholder: "",
-                defaultValue: "",
-              };
-            });
-            await this.plugin.saveSettings();
+        text.setValue(normalizeParameters(script.parameters).map((parameter) => parameter.name).join(", ")).onChange(async (value) => {
+          script.parameters = parseParameterNames(value).map((name) => {
+            const existing = normalizeParameters(script.parameters).find((parameter) => parameter.name === name);
+            return existing || { name, label: humanize(name), placeholder: "", defaultValue: "" };
           });
-      });
-
-    new Setting(wrapper)
-      .setName("Use virtual environment")
-      .setDesc("Create the venv if missing, install requirements when they change, and expose {{venvPython}}.")
-      .addToggle((toggle) => {
-        toggle.setValue(Boolean(script.useVenv)).onChange(async (value) => {
-          script.useVenv = value;
           await this.plugin.saveSettings();
         });
       });
 
-    new Setting(wrapper)
-      .setName("Virtual environment path")
-      .setDesc("Optional. Relative paths resolve from the vault. Defaults to the global venv path.")
-      .addText((text) => {
-        text.setPlaceholder("{{pluginDir}}\\.venv").setValue(script.venvPath || "").onChange(async (value) => {
-          script.venvPath = value;
-          await this.plugin.saveSettings();
-        });
+    new Setting(wrapper).setName("Use virtual environment").addToggle((toggle) => {
+      toggle.setValue(Boolean(script.useVenv)).onChange(async (value) => {
+        script.useVenv = value;
+        await this.plugin.saveSettings();
       });
+    });
+
+    new Setting(wrapper).setName("Requirements").addTextArea((text) => {
+      text.inputEl.rows = 5;
+      text.inputEl.cols = 60;
+      text.setValue(script.requirements || "").onChange(async (value) => {
+        script.requirements = value;
+        await this.plugin.saveSettings();
+      });
+    });
+
+    new Setting(wrapper).setName("Environment").addTextArea((text) => {
+      text.inputEl.rows = 4;
+      text.inputEl.cols = 60;
+      text.setValue(script.env || "").onChange(async (value) => {
+        script.env = value;
+        await this.plugin.saveSettings();
+      });
+    });
+
+    new Setting(wrapper).setName("Run in shell").addToggle((toggle) => {
+      toggle.setValue(Boolean(script.runInShell)).onChange(async (value) => {
+        script.runInShell = value;
+        await this.plugin.saveSettings();
+      });
+    });
+
+    new Setting(wrapper).setName("Open output").addToggle((toggle) => {
+      toggle.setValue(script.openOutput !== false).onChange(async (value) => {
+        script.openOutput = value;
+        await this.plugin.saveSettings();
+      });
+    });
 
     new Setting(wrapper)
-      .setName("Venv creator Python")
-      .setDesc("Optional override for creating this script's venv.")
-      .addText((text) => {
-        text.setPlaceholder("python").setValue(script.pythonExecutable || "").onChange(async (value) => {
-          script.pythonExecutable = value;
-          await this.plugin.saveSettings();
-        });
-      });
-
-    new Setting(wrapper)
-      .setName("Requirements")
-      .setDesc("Optional pip requirements. Written to a temporary requirements file and installed into the venv.")
-      .addTextArea((text) => {
-        text.inputEl.rows = 5;
-        text.inputEl.cols = 60;
-        text.setValue(script.requirements || "").onChange(async (value) => {
-          script.requirements = value;
-          await this.plugin.saveSettings();
-        });
-      });
-
-    new Setting(wrapper)
-      .setName("Environment")
-      .setDesc("Optional KEY=value lines. Templates are supported.")
-      .addTextArea((text) => {
-        text.inputEl.rows = 4;
-        text.inputEl.cols = 60;
-        text.setValue(script.env || "").onChange(async (value) => {
-          script.env = value;
-          await this.plugin.saveSettings();
-        });
-      });
-
-    new Setting(wrapper)
-      .setName("Run in shell")
-      .setDesc("Enable for shell built-ins or command strings. Leave off for normal executables.")
-      .addToggle((toggle) => {
-        toggle.setValue(Boolean(script.runInShell)).onChange(async (value) => {
-          script.runInShell = value;
-          await this.plugin.saveSettings();
-        });
-      });
-
-    new Setting(wrapper)
-      .setName("Open output")
-      .setDesc("Open stdout/stderr when the script finishes. Failures and first-time setup always open output.")
-      .addToggle((toggle) => {
-        toggle.setValue(script.openOutput !== false).onChange(async (value) => {
-          script.openOutput = value;
-          await this.plugin.saveSettings();
-        });
-      });
-
-    new Setting(wrapper)
-      .setName("Remove")
-      .setDesc("Delete this script preset.")
+      .setName("Remove preset")
+      .setDesc("This removes the preset only. Downloaded script files remain installed.")
       .addButton((button) => {
         button.setWarning().setButtonText("Remove").onClick(async () => {
           this.plugin.settings.scripts.splice(index, 1);
@@ -724,24 +770,25 @@ class VaultScriptRunnerSettingTab extends PluginSettingTab {
   }
 }
 
-function mergeSettings(defaults, loaded) {
-  const copy = JSON.parse(JSON.stringify(defaults));
-  if (!loaded || typeof loaded !== "object") {
-    return copy;
+function normalizeCatalogEntry(entry) {
+  if (!entry || !entry.id || !entry.name || !(entry.url || entry.path || entry.fileName)) {
+    return null;
   }
-
-  const loadedScripts = Array.isArray(loaded.scripts) ? loaded.scripts : copy.scripts;
   return {
-    ...copy,
-    ...loaded,
-    pythonExecutable: loaded.pythonExecutable || copy.pythonExecutable,
-    defaultVenvPath: loaded.defaultVenvPath || copy.defaultVenvPath,
-    scripts: loadedScripts.map((script) => normalizeScript(script)),
+    id: String(entry.id),
+    name: String(entry.name),
+    version: String(entry.version || "0.0.0"),
+    description: String(entry.description || ""),
+    fileName: safeScriptFileName(entry.fileName || path.basename(entry.path || entry.url || entry.id)),
+    path: entry.path || "",
+    url: entry.url || "",
+    sha256: entry.sha256 || "",
+    preset: entry.preset || null,
   };
 }
 
 function normalizeScript(script) {
-  const normalized = {
+  return {
     id: script.id || slugify(script.name || `script-${Date.now()}`),
     name: script.name || "Script",
     command: script.command || "",
@@ -755,121 +802,45 @@ function normalizeScript(script) {
     requirements: script.requirements || "",
     runInShell: Boolean(script.runInShell),
     openOutput: script.openOutput !== false,
+    catalogScriptId: script.catalogScriptId || "",
   };
-
-  if (normalized.id === PDF_SCRIPT_ID) {
-    if (script.useVenv === undefined) {
-      normalized.useVenv = true;
-    }
-    if (!script.requirements) {
-      normalized.requirements = "pymupdf";
-    }
-    if (!script.command || script.command === "python") {
-      normalized.command = "{{venvPython}}";
-      normalized.runInShell = false;
-    }
-    normalized.arguments = migratePdfOutputArgument(normalized.arguments);
-    normalized.arguments = setPdfArgument(normalized.arguments, "--link-style", "html");
-    normalized.arguments = setPdfArgument(normalized.arguments, "--alt-text", "extracted");
-    normalized.arguments = setPdfArgument(normalized.arguments, "--text-output", "none");
-    normalized.arguments = ensurePdfArgument(normalized.arguments, "--format", "jpg");
-    normalized.arguments = ensurePdfArgument(normalized.arguments, "--attachment-subdir", "{pdf_stem}");
-    ensureParameterDefault(
-      normalized.parameters,
-      "pdfPath",
-      "PDF path",
-      "C:\\Users\\you\\Downloads\\lecture.pdf",
-      "{{latestDownloadPdf}}"
-    );
-  }
-
-  if (normalized.useVenv && isGenericPythonCommand(normalized.command)) {
-    normalized.command = "{{venvPython}}";
-    normalized.runInShell = false;
-  }
-
-  return normalized;
 }
 
 function createBlankScript() {
-  return {
-    id: `script-${Date.now()}`,
-    name: "New script",
-    command: "",
-    arguments: "",
-    cwd: "{{vault}}",
-    parameters: [],
-    env: "",
-    useVenv: false,
-    venvPath: "",
-    pythonExecutable: "",
-    requirements: "",
-    runInShell: false,
-    openOutput: true,
-  };
+  return normalizeScript({ id: `script-${Date.now()}`, name: "New script", cwd: "{{vault}}", openOutput: true });
 }
 
 function createPythonScript() {
-  return {
+  return normalizeScript({
     id: `python-script-${Date.now()}`,
     name: "New Python script",
     command: "{{venvPython}}",
-    arguments: "",
     cwd: "{{vault}}",
-    parameters: [],
-    env: "",
     useVenv: true,
-    venvPath: "",
-    pythonExecutable: "",
-    requirements: "",
-    runInShell: false,
     openOutput: true,
-  };
+  });
+}
+
+function upsertScriptPreset(scripts, preset) {
+  const index = scripts.findIndex((script) => script.id === preset.id);
+  if (index >= 0) scripts[index] = preset;
+  else scripts.push(preset);
 }
 
 function normalizeParameters(parameters) {
-  if (!Array.isArray(parameters)) {
-    return [];
-  }
+  if (!Array.isArray(parameters)) return [];
   return parameters
     .map((parameter) => {
       if (typeof parameter === "string") {
-        return {
-          name: parameter,
-          label: humanize(parameter),
-          placeholder: "",
-          defaultValue: "",
-        };
+        return { name: parameter, label: humanize(parameter), placeholder: "", defaultValue: "" };
       }
       return parameter;
     })
     .filter((parameter) => parameter && parameter.name);
 }
 
-function ensureParameterDefault(parameters, name, label, placeholder, defaultValue) {
-  let parameter = parameters.find((item) => item.name === name);
-  if (!parameter) {
-    parameter = {
-      name,
-      label,
-      placeholder,
-      defaultValue,
-    };
-    parameters.push(parameter);
-    return;
-  }
-  parameter.label = parameter.label || label;
-  parameter.placeholder = parameter.placeholder || placeholder;
-  if (!parameter.defaultValue) {
-    parameter.defaultValue = defaultValue;
-  }
-}
-
 function parseParameterNames(value) {
-  return String(value || "")
-    .split(",")
-    .map((item) => item.trim())
-    .filter(Boolean);
+  return String(value || "").split(",").map((item) => item.trim()).filter(Boolean);
 }
 
 function parseArgumentLines(value) {
@@ -883,16 +854,10 @@ function parseEnvironment(value, renderTemplate) {
   const env = {};
   for (const line of String(value || "").split(/\r?\n/)) {
     const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) {
-      continue;
-    }
-    const equalsIndex = trimmed.indexOf("=");
-    if (equalsIndex < 1) {
-      continue;
-    }
-    const key = trimmed.slice(0, equalsIndex).trim();
-    const envValue = trimmed.slice(equalsIndex + 1);
-    env[key] = renderTemplate(envValue);
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const index = trimmed.indexOf("=");
+    if (index < 1) continue;
+    env[trimmed.slice(0, index).trim()] = renderTemplate(trimmed.slice(index + 1));
   }
   return env;
 }
@@ -905,70 +870,101 @@ function normalizeRequirementText(value) {
     .join("\n");
 }
 
-function migratePdfOutputArgument(argumentsText) {
-  const lines = String(argumentsText || "").split(/\r?\n/);
-  for (let index = 0; index < lines.length - 1; index += 1) {
-    if (lines[index].trim() !== "--output") {
-      continue;
+async function readTextLocation(location, baseDir) {
+  if (/^https?:\/\//i.test(location)) {
+    const response = await requestUrl({ url: location, method: "GET" });
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error(`HTTP ${response.status} for ${location}`);
     }
-
-    const current = lines[index + 1].trim();
-    const legacyOutputs = new Set([
-      "Courses\\Robot Learning\\Lectures\\{{pdfPath.stem}}.md",
-      "Courses/Robot Learning/Lectures/{{pdfPath.stem}}.md",
-    ]);
-    if (!current || legacyOutputs.has(current)) {
-      lines[index + 1] = "{{activeFolderPrefix}}{{pdfPath.stem}}.md";
-    }
-    break;
+    return response.text;
   }
-  return lines.join("\n");
+
+  let filePath = location;
+  if (/^file:\/\//i.test(location)) {
+    filePath = fileURLToPath(location);
+  } else if (!path.isAbsolute(filePath)) {
+    filePath = path.resolve(baseDir, filePath);
+  }
+  return fs.readFileSync(filePath, "utf8");
 }
 
-function ensurePdfArgument(argumentsText, flag, value) {
-  const lines = String(argumentsText || "").split(/\r?\n/);
-  if (lines.some((line) => line.trim() === flag)) {
-    return lines.join("\n");
+function resolveLocation(location, baseLocation) {
+  if (!location) return "";
+  if (/^https?:\/\//i.test(location) || /^file:\/\//i.test(location) || path.isAbsolute(location)) {
+    return location;
   }
-
-  let insertIndex = lines.length;
-  for (let index = 0; index < lines.length; index += 1) {
-    if (lines[index].includes("{{pdfPath}}")) {
-      insertIndex = index;
-      break;
-    }
+  if (/^https?:\/\//i.test(baseLocation)) {
+    return new URL(location, baseLocation).toString();
   }
-
-  lines.splice(insertIndex, 0, flag, value);
-  return lines.join("\n");
+  const basePath = /^file:\/\//i.test(baseLocation) ? fileURLToPath(baseLocation) : baseLocation;
+  return path.resolve(path.dirname(basePath), location);
 }
 
-function setPdfArgument(argumentsText, flag, value) {
-  const lines = String(argumentsText || "").split(/\r?\n/);
-  for (let index = 0; index < lines.length; index += 1) {
-    if (lines[index].trim() !== flag) {
-      continue;
-    }
-    if (index === lines.length - 1) {
-      lines.push(value);
-    } else {
-      lines[index + 1] = value;
-    }
-    return lines.join("\n");
+function compareVersions(left, right) {
+  const a = String(left).split(/[^\d]+/).filter(Boolean).map(Number);
+  const b = String(right).split(/[^\d]+/).filter(Boolean).map(Number);
+  const length = Math.max(a.length, b.length);
+  for (let i = 0; i < length; i += 1) {
+    const diff = (a[i] || 0) - (b[i] || 0);
+    if (diff !== 0) return diff;
   }
-  return ensurePdfArgument(lines.join("\n"), flag, value);
+  return 0;
 }
 
-function isGenericPythonCommand(value) {
-  const command = stripWrappingQuotes(String(value || "").trim()).toLowerCase();
-  return command === "python" || command === "python.exe" || command === "py";
+function runProcess(command, args, options) {
+  return new Promise((resolve) => {
+    const startedAt = new Date();
+    let stdout = "";
+    let stderr = "";
+    const outputLimit = 300000;
+    let finished = false;
+    const finish = (result) => {
+      if (finished) return;
+      finished = true;
+      resolve({
+        command,
+        args,
+        cwd: options.cwd || "",
+        startedAt,
+        finishedAt: new Date(),
+        code: result.code,
+        signal: result.signal || null,
+        stdout,
+        stderr,
+      });
+    };
+
+    let child;
+    try {
+      child = spawn(command, args, {
+        cwd: options.cwd || undefined,
+        env: options.env || process.env,
+        shell: Boolean(options.shell),
+        windowsHide: true,
+      });
+    } catch (error) {
+      stderr = appendLimited(stderr, `${error.stack || error.message}\n`, outputLimit);
+      finish({ code: null, signal: null });
+      return;
+    }
+
+    child.stdout.on("data", (chunk) => {
+      stdout = appendLimited(stdout, chunk.toString(), outputLimit);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr = appendLimited(stderr, chunk.toString(), outputLimit);
+    });
+    child.on("error", (error) => {
+      stderr = appendLimited(stderr, `${error.stack || error.message}\n`, outputLimit);
+      finish({ code: null, signal: null });
+    });
+    child.on("close", (code, signal) => finish({ code, signal }));
+  });
 }
 
 function addPathVariables(variables, prefix, rawValue) {
   const value = String(rawValue || "");
-  if (!value) {
-    return;
-  }
+  if (!value) return;
   variables[`${prefix}.basename`] = path.basename(value);
   variables[`${prefix}.stem`] = path.basename(value, path.extname(value));
   variables[`${prefix}.dirname`] = path.dirname(value);
@@ -978,15 +974,12 @@ function addPathVariables(variables, prefix, rawValue) {
 function findLatestFile(directory, extension) {
   try {
     const normalizedExtension = extension ? extension.toLowerCase() : "";
-    const files = fs
-      .readdirSync(directory, { withFileTypes: true })
-      .filter((entry) => entry.isFile())
-      .map((entry) => path.join(directory, entry.name))
-      .filter((filePath) => !normalizedExtension || path.extname(filePath).toLowerCase() === normalizedExtension);
-
     let latestPath = "";
     let latestTime = -1;
-    for (const filePath of files) {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      if (!entry.isFile()) continue;
+      const filePath = path.join(directory, entry.name);
+      if (normalizedExtension && path.extname(filePath).toLowerCase() !== normalizedExtension) continue;
       const stat = fs.statSync(filePath);
       if (stat.mtimeMs > latestTime) {
         latestTime = stat.mtimeMs;
@@ -999,97 +992,21 @@ function findLatestFile(directory, extension) {
   }
 }
 
-function normalizeObsidianFolder(value) {
-  const normalized = String(value || "").replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
-  if (normalized === "." || normalized === "/") {
-    return "";
-  }
-  return normalized;
-}
-
 function getVenvPythonPath(venvPath) {
-  if (process.platform === "win32") {
-    return path.join(venvPath, "Scripts", "python.exe");
-  }
-  return path.join(venvPath, "bin", "python");
-}
-
-function runProcess(command, args, options) {
-  return new Promise((resolve) => {
-    const startedAt = new Date();
-    let stdout = "";
-    let stderr = "";
-    const outputLimit = 300000;
-    let child;
-    let finished = false;
-
-    const finish = (result) => {
-      if (finished) {
-        return;
-      }
-      finished = true;
-      resolve({
-        command,
-        args,
-        cwd: options.cwd || "",
-        startedAt,
-        finishedAt: new Date(),
-        code: result.code,
-        signal: result.signal || null,
-        stdout,
-        stderr,
-        error: result.error || null,
-      });
-    };
-
-    try {
-      child = spawn(command, args, {
-        cwd: options.cwd || undefined,
-        env: options.env || process.env,
-        shell: Boolean(options.shell),
-        windowsHide: true,
-      });
-    } catch (error) {
-      stderr = appendLimited(stderr, `${error.stack || error.message}\n`, outputLimit);
-      finish({ code: null, signal: null, error });
-      return;
-    }
-
-    child.stdout.on("data", (chunk) => {
-      stdout = appendLimited(stdout, chunk.toString(), outputLimit);
-    });
-
-    child.stderr.on("data", (chunk) => {
-      stderr = appendLimited(stderr, chunk.toString(), outputLimit);
-    });
-
-    child.on("error", (error) => {
-      stderr = appendLimited(stderr, `${error.stack || error.message}\n`, outputLimit);
-      finish({ code: null, signal: null, error });
-    });
-
-    child.on("close", (code, signal) => {
-      finish({ code, signal });
-    });
-  });
+  return process.platform === "win32" ? path.join(venvPath, "Scripts", "python.exe") : path.join(venvPath, "bin", "python");
 }
 
 function appendLimited(existing, addition, limit) {
   const combined = existing + addition;
-  if (combined.length <= limit) {
-    return combined;
-  }
-  return combined.slice(combined.length - limit);
+  return combined.length <= limit ? combined : combined.slice(combined.length - limit);
 }
 
 function stripWrappingQuotes(value) {
-  if (
-    (value.startsWith('"') && value.endsWith('"')) ||
-    (value.startsWith("'") && value.endsWith("'"))
-  ) {
-    return value.slice(1, -1);
+  const text = String(value || "");
+  if ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"))) {
+    return text.slice(1, -1);
   }
-  return value;
+  return text;
 }
 
 function readTextIfExists(filePath) {
@@ -1098,6 +1015,15 @@ function readTextIfExists(filePath) {
   } catch (_error) {
     return null;
   }
+}
+
+function safeScriptFileName(value) {
+  const name = path.basename(String(value || "script.py"));
+  return name.replace(/[<>:"/\\|?*\x00-\x1F]/g, "-") || "script.py";
+}
+
+function sha256(value) {
+  return crypto.createHash("sha256").update(value, "utf8").digest("hex");
 }
 
 function formatSetupLog(entry) {
@@ -1120,38 +1046,26 @@ function formatCommandLine(command, args) {
 
 function quoteForDisplay(value) {
   const text = String(value || "");
-  if (!text || /[\s"]/u.test(text)) {
-    return `"${text.replace(/"/g, '\\"')}"`;
-  }
-  return text;
+  return !text || /[\s"]/u.test(text) ? `"${text.replace(/"/g, '\\"')}"` : text;
+}
+
+function normalizeObsidianFolder(value) {
+  const normalized = String(value || "").replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  return normalized === "." || normalized === "/" ? "" : normalized;
 }
 
 function formatDate(date) {
-  return [
-    date.getFullYear(),
-    String(date.getMonth() + 1).padStart(2, "0"),
-    String(date.getDate()).padStart(2, "0"),
-  ].join("-");
+  return [date.getFullYear(), String(date.getMonth() + 1).padStart(2, "0"), String(date.getDate()).padStart(2, "0")].join("-");
 }
 
 function formatTime(date) {
-  return [
-    String(date.getHours()).padStart(2, "0"),
-    String(date.getMinutes()).padStart(2, "0"),
-    String(date.getSeconds()).padStart(2, "0"),
-  ].join("-");
+  return [String(date.getHours()).padStart(2, "0"), String(date.getMinutes()).padStart(2, "0"), String(date.getSeconds()).padStart(2, "0")].join("-");
 }
 
 function slugify(value) {
-  return String(value || "script")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "") || "script";
+  return String(value || "script").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "script";
 }
 
 function humanize(value) {
-  return String(value || "")
-    .replace(/[_-]+/g, " ")
-    .replace(/([a-z])([A-Z])/g, "$1 $2")
-    .replace(/^./, (char) => char.toUpperCase());
+  return String(value || "").replace(/[_-]+/g, " ").replace(/([a-z])([A-Z])/g, "$1 $2").replace(/^./, (char) => char.toUpperCase());
 }

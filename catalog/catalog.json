@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "scripts": [
+    {
+      "id": "pdf-to-obsidian-images",
+      "name": "PDF to Obsidian images",
+      "version": "1.3.3",
+      "description": "Render a PDF into per-page JPG images, create a Markdown note, and store extracted page text in hidden HTML alt attributes.",
+      "fileName": "pdf_to_obsidian_images.py",
+      "path": "pdf_to_obsidian_images.py",
+      "preset": {
+        "id": "pdf-to-obsidian-images",
+        "name": "PDF to Obsidian images",
+        "command": "{{venvPython}}",
+        "arguments": "{{scriptPath}}\n--vault\n{{vault}}\n--attachments\n_Attachments\n--attachment-subdir\n{pdf_stem}\n--output\n{{activeFolderPrefix}}{{pdfPath.stem}}.md\n--title\n{{pdfPath.stem}}\n--backend\nauto\n--link-style\nhtml\n--alt-text\nextracted\n--text-output\nnone\n--format\njpg\n{{pdfPath}}",
+        "cwd": "{{vault}}",
+        "parameters": [
+          {
+            "name": "pdfPath",
+            "label": "PDF path",
+            "placeholder": "C:\\Users\\you\\Downloads\\lecture.pdf",
+            "defaultValue": "{{latestDownloadPdf}}"
+          }
+        ],
+        "env": "",
+        "useVenv": true,
+        "venvPath": "",
+        "pythonExecutable": "",
+        "requirements": "pymupdf",
+        "runInShell": false,
+        "openOutput": true
+      }
+    }
+  ]
+}
