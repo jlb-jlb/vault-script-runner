@@ -1,10 +1,11 @@
 {
   "id": "vault-script-runner",
   "name": "Vault Script Runner",
-  "version": "0.0.5",
+  "version": "0.0.7",
   "minAppVersion": "1.0.0",
   "description": "Run configured local scripts from Obsidian with prompted parameters.",
   "author": "Joscha Bisping",
   "isDesktopOnly": true
 }
+
 

@@ -16,6 +16,7 @@ const DEFAULT_SETTINGS = {
 
 module.exports = class VaultScriptRunnerPlugin extends Plugin {
   async onload() {
+    this.scriptCommandIds = new Set();
     await this.loadSettings();
 
     this.addRibbonIcon("terminal", "Run script", () => this.openScriptPicker());
@@ -40,6 +41,7 @@ module.exports = class VaultScriptRunnerPlugin extends Plugin {
     });
 
     this.addSettingTab(new VaultScriptRunnerSettingTab(this.app, this));
+    this.refreshScriptCommands();
   }
 
   async loadSettings() {
@@ -55,6 +57,9 @@ module.exports = class VaultScriptRunnerPlugin extends Plugin {
 
   async saveSettings() {
     await this.saveData(this.settings);
+    if (this.scriptCommandIds) {
+      this.refreshScriptCommands();
+    }
   }
 
   getVaultBasePath() {
@@ -81,6 +86,44 @@ module.exports = class VaultScriptRunnerPlugin extends Plugin {
     return Array.isArray(this.settings.scripts)
       ? this.settings.scripts.filter((script) => script && script.name && script.command)
       : [];
+  }
+
+  refreshScriptCommands() {
+    if (!this.scriptCommandIds) {
+      this.scriptCommandIds = new Set();
+    }
+
+    for (const commandId of this.scriptCommandIds) {
+      this.removeCommandById(commandId);
+    }
+    this.scriptCommandIds.clear();
+
+    const usedIds = new Set(["run-configured-script", "refresh-script-catalog"]);
+    this.getScripts().forEach((script, index) => {
+      const commandId = uniqueCommandId(`run-script-${script.id || script.name || index + 1}`, usedIds);
+      usedIds.add(commandId);
+      this.scriptCommandIds.add(commandId);
+      this.addCommand({
+        id: commandId,
+        name: `Run ${script.name}`,
+        callback: () => {
+          const currentScript = this.getScripts().find((candidate) => candidate.id === script.id) || script;
+          this.openRunModal(currentScript);
+        },
+      });
+    });
+  }
+
+  removeCommandById(commandId) {
+    const commands = this.app.commands;
+    const fullId = `${this.manifest.id}:${commandId}`;
+    if (commands && typeof commands.removeCommand === "function") {
+      commands.removeCommand(fullId);
+      return;
+    }
+    if (commands && commands.commands) {
+      delete commands.commands[fullId];
+    }
   }
 
   openScriptPicker() {
@@ -1020,6 +1063,17 @@ function readTextIfExists(filePath) {
 function safeScriptFileName(value) {
   const name = path.basename(String(value || "script.py"));
   return name.replace(/[<>:"/\\|?*\x00-\x1F]/g, "-") || "script.py";
+}
+
+function uniqueCommandId(value, usedIds) {
+  const base = slugify(value || "run-script");
+  let candidate = base;
+  let suffix = 2;
+  while (usedIds.has(candidate)) {
+    candidate = `${base}-${suffix}`;
+    suffix += 1;
+  }
+  return candidate;
 }
 
 function sha256(value) {
