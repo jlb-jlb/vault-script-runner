@@ -19,13 +19,21 @@ plugin version and whose assets are the three files Obsidian loads: `main.js`,
 
 ## Steps
 
-### 1. Bump the version in manifest.json
+### 1. Bump the version in manifest.json and versions.json
 
 Edit `manifest.json` and set `version` to the new release number. Keep
 `minAppVersion` unless a newer Obsidian API is actually required.
 
 ```json
 { "id": "vault-script-runner", "version": "0.0.8", ... }
+```
+
+Add a matching entry to `versions.json` mapping the new version to the
+`minAppVersion` it requires (Obsidian uses this so older apps install the last
+compatible version):
+
+```json
+{ "0.0.8": "1.0.0" }
 ```
 
 Commit and push the bump (the asset files must match the tag on `main`):

@@ -96,6 +96,31 @@ For path-like values, derived variables are available:
 
 The same suffixes work for any parameter name.
 
-## Security
+## Security and disclosures
 
-This plugin downloads and runs local scripts with your user account permissions. Only use catalogs and scripts you trust.
+This plugin is desktop-only and runs local scripts on your machine. Please read the following before using it.
+
+### Code execution
+
+The plugin launches local executables and scripts (for example Python) as child processes with your user account's permissions, using the commands and arguments you configure. Downloaded scripts and any command you configure can read, write, and delete files anywhere your user account can, including outside the vault. **Only use catalogs, scripts, and commands you trust.**
+
+### Network use
+
+The plugin connects to the network only to fetch the **script catalog** and to **download scripts** you explicitly choose to install:
+
+- The catalog is downloaded from the **Script catalog URL** in settings. The default is the author's catalog on GitHub (`raw.githubusercontent.com/jlb-jlb/vault-script-runner`). You can change it to any URL you trust, or point it at a local file.
+- When you click **Download**/**Update** for a catalog entry, the corresponding script file is fetched from the location named in the catalog and saved into the plugin's `scripts/` folder.
+
+No other data is sent anywhere. The plugin contains no telemetry, analytics, or advertising, and it does not update itself.
+
+### File access outside the vault
+
+Beyond reading and writing inside your vault, the plugin:
+
+- Reads your Downloads folder to resolve the `{{downloads}}` / `{{latestDownload}}` template variables (auto-detected, or set explicitly in settings).
+- Creates and manages a Python virtual environment at the configured **Default virtual environment path** (by default inside the plugin folder).
+- Runs scripts that may access any path you pass to them.
+
+### Trust model
+
+You are responsible for the scripts and commands you run. Review a script before downloading it, keep the catalog URL pointed at a source you trust, and remember that presets run with your full user permissions.

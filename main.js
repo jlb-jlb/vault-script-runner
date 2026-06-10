@@ -135,14 +135,14 @@ module.exports = class VaultScriptRunnerPlugin extends Plugin {
   }
 
   removeCommandById(commandId) {
+    // Obsidian exposes no public API for removing a command at runtime, which is
+    // needed to refresh the per-script palette entries when presets change.
+    // removeCommand is the narrowest available call; guard it so a future API
+    // change degrades gracefully instead of throwing.
     const commands = this.app.commands;
     const fullId = `${this.manifest.id}:${commandId}`;
     if (commands && typeof commands.removeCommand === "function") {
       commands.removeCommand(fullId);
-      return;
-    }
-    if (commands && commands.commands) {
-      delete commands.commands[fullId];
     }
   }
 
@@ -608,7 +608,6 @@ class VaultScriptRunnerSettingTab extends PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: "Vault Script Runner" });
 
     new Setting(containerEl)
       .setName("Python executable")
