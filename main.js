@@ -9,7 +9,7 @@ const { fileURLToPath } = require("url");
 const DEFAULT_SETTINGS = {
   pythonExecutable: "python",
   defaultVenvPath: "{{pluginDir}}\\.venv",
-  scriptCatalogUrl: "{{pluginDir}}\\catalog\\catalog.json",
+  scriptCatalogUrl: "https://raw.githubusercontent.com/jlb-jlb/vault-script-runner/main/catalog/catalog.json",
   installedScripts: {},
   scripts: [],
 };

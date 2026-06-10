@@ -18,7 +18,7 @@ Reload Obsidian and enable **Vault Script Runner** under Community plugins.
 
 Open **Settings -> Vault Script Runner**.
 
-1. Set **Script catalog URL** if you do not want to use the bundled local catalog.
+1. Set **Script catalog URL** if you do not want to use the default GitHub catalog.
 2. Click **Download** next to any available script.
 3. Run the generated preset from the command palette command **Run configured script**.
 

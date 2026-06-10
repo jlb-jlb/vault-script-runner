@@ -1,6 +1,4 @@
 {
-  "pythonExecutable": "python",
-  "defaultVenvPath": "{{pluginDir}}\\.venv",
   "scripts": [
     {
       "id": "pdf-to-obsidian-images",
@@ -24,5 +22,9 @@
       "runInShell": false,
       "openOutput": true
     }
-  ]
+  ],
+  "pythonExecutable": "python",
+  "defaultVenvPath": "{{pluginDir}}\\.venv",
+  "scriptCatalogUrl": "https://raw.githubusercontent.com/jlb-jlb/vault-script-runner/main/catalog/catalog.json",
+  "installedScripts": {}
 }
