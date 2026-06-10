@@ -180,6 +180,13 @@ module.exports = class VaultScriptRunnerPlugin extends Plugin {
     if (!installed) {
       return { status: "download", installed, scriptPath };
     }
+    // If the install record survived but its preset is gone (e.g. the preset
+    // was removed in an older version), offer the script for download again so
+    // re-downloading restores a usable preset instead of leaving a dead record.
+    const hasPreset = (this.settings.scripts || []).some((script) => script.catalogScriptId === entry.id);
+    if (!hasPreset) {
+      return { status: "download", installed, scriptPath };
+    }
     if (compareVersions(entry.version || "0.0.0", installed.version || "0.0.0") > 0) {
       return { status: "update", installed, scriptPath };
     }
@@ -708,8 +715,9 @@ class VaultScriptRunnerSettingTab extends PluginSettingTab {
   }
 
   renderScript(containerEl, script, index) {
-    const wrapper = containerEl.createDiv({ cls: "vault-script-runner-script" });
-    wrapper.createEl("h3", { text: script.name || `Script ${index + 1}` });
+    const wrapper = containerEl.createEl("details", { cls: "vault-script-runner-script" });
+    const summary = wrapper.createEl("summary", { cls: "vault-script-runner-script-summary" });
+    summary.createEl("span", { cls: "vault-script-runner-script-title", text: script.name || `Script ${index + 1}` });
 
     if (script.catalogScriptId) {
       wrapper.createEl("p", { cls: "vault-script-runner-help", text: `Catalog script: ${script.catalogScriptId}` });
@@ -800,12 +808,28 @@ class VaultScriptRunnerSettingTab extends PluginSettingTab {
       });
     });
 
+    const removeDesc = script.catalogScriptId
+      ? "Removes the preset and uninstalls the downloaded script file, so it can be downloaded again from the catalog."
+      : "Removes this preset.";
     new Setting(wrapper)
       .setName("Remove preset")
-      .setDesc("This removes the preset only. Downloaded script files remain installed.")
+      .setDesc(removeDesc)
       .addButton((button) => {
         button.setWarning().setButtonText("Remove").onClick(async () => {
-          this.plugin.settings.scripts.splice(index, 1);
+          const [removed] = this.plugin.settings.scripts.splice(index, 1);
+          const catalogId = removed?.catalogScriptId;
+          if (catalogId && this.plugin.settings.installedScripts?.[catalogId]) {
+            const installed = this.plugin.settings.installedScripts[catalogId];
+            const scriptPath = path.join(this.plugin.getScriptsDir(), installed.fileName);
+            try {
+              if (fs.existsSync(scriptPath)) {
+                fs.unlinkSync(scriptPath);
+              }
+            } catch (error) {
+              new Notice(`Removed preset, but could not delete ${installed.fileName}: ${error.message}`, 8000);
+            }
+            delete this.plugin.settings.installedScripts[catalogId];
+          }
           await this.plugin.saveSettings();
           this.display();
         });

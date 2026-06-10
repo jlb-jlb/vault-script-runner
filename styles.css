@@ -9,6 +9,17 @@
   margin: 0 0 8px;
 }
 
+.vault-script-runner-script-summary {
+  cursor: pointer;
+  font-size: var(--font-ui-medium);
+  font-weight: 600;
+  user-select: none;
+}
+
+details.vault-script-runner-script[open] > .vault-script-runner-script-summary {
+  margin-bottom: 8px;
+}
+
 .vault-script-runner-help {
   color: var(--text-muted);
   font-size: var(--font-ui-small);
