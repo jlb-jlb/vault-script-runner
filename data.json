@@ -1,0 +1,28 @@
+{
+  "pythonExecutable": "python",
+  "defaultVenvPath": "{{pluginDir}}\\.venv",
+  "scripts": [
+    {
+      "id": "pdf-to-obsidian-images",
+      "name": "PDF to Obsidian images",
+      "command": "{{venvPython}}",
+      "arguments": "{{pluginDir}}\\scripts\\pdf_to_obsidian_images.py\n--vault\n{{vault}}\n--attachments\n_Attachments\n--output\n{{activeFolderPrefix}}{{pdfPath.stem}}.md\n--title\n{{pdfPath.stem}}\n--backend\nauto\n--link-style\nhtml\n--alt-text\nextracted\n--format\njpg\n--attachment-subdir\n{pdf_stem}\n--text-output\nnone\n{{pdfPath}}",
+      "cwd": "{{vault}}",
+      "parameters": [
+        {
+          "name": "pdfPath",
+          "label": "PDF path",
+          "placeholder": "C:\\Users\\you\\Downloads\\lecture.pdf",
+          "defaultValue": "{{latestDownloadPdf}}"
+        }
+      ],
+      "env": "",
+      "useVenv": true,
+      "venvPath": "",
+      "pythonExecutable": "",
+      "requirements": "pymupdf",
+      "runInShell": false,
+      "openOutput": true
+    }
+  ]
+}
